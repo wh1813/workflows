@@ -22,5 +22,5 @@ jobs:
         with:
           context: .
           push: true
-          # 注意：请确保 wh1813 是你的 Docker Hub 用户名
-          tags: wh1813/web-bot:latest
+          # 注意：请确保 loko219是你的 Docker Hub 用户名
+          tags: loko219/web-bot:latest
