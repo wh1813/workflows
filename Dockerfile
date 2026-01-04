@@ -4,20 +4,18 @@ FROM python:3.9-slim
 # 设置工作目录
 WORKDIR /app
 
-# 1. 安装基础工具 (只安装最核心的，不手动装 Chrome 依赖)
+# 1. 更新 apt 并安装 wget (仅用于下载)
 RUN apt-get update && apt-get install -y \
     wget \
-    gnupg \
-    ca-certificates \
-    unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. 添加 Google Chrome 官方源并安装
-# 这一步会自动处理 libxss1, libappindicator 等所有依赖，不需要手动写
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list \
+# 2. 直接下载 Chrome .deb 包并使用 apt 安装
+# 说明：使用 apt install ./xxx.deb 会自动解决所有依赖问题
+# 这种方式避开了 keys、gnupg 和 source.list 的所有坑
+RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get update \
-    && apt-get install -y google-chrome-stable \
+    && apt-get install -y ./google-chrome-stable_current_amd64.deb \
+    && rm google-chrome-stable_current_amd64.deb \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. 安装 Python 依赖
