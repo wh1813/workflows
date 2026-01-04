@@ -4,9 +4,10 @@ import logging
 import random
 import sys
 import shutil
+import traceback
 import undetected_chromedriver as uc
 
-# 1. 配置日志：强制输出到标准输出 (stdout)，解决 Docker 看不到日志的问题
+# 1. 配置日志：强制输出到标准输出 (stdout)，确保 Docker 能抓取到日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -16,48 +17,50 @@ logging.basicConfig(
 )
 
 def run_automation():
-    # 清理旧的缓存目录（如果存在），防止占用空间或权限错误
+    print(">>> [步骤1] 正在清理缓存环境...")
+    # 清理旧的缓存目录，防止权限冲突
     data_dir = "/tmp/chrome_user_data"
     if os.path.exists(data_dir):
         shutil.rmtree(data_dir, ignore_errors=True)
 
     # 2. 配置 undetected_chromedriver
+    print(">>> [步骤2] 配置 Chrome 选项...")
     options = uc.ChromeOptions()
     
-    # 【关键】新版无头模式，必须由 uc 库处理
-    # 注意：在 uc.Chrome() 初始化时会再次确认 headless 参数，这里添加是双重保险
+    # 【核心伪装】：启用新版无头模式
     options.add_argument("--headless=new")
     
-    # Docker 必须参数
+    # Docker 环境必须参数
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-setuid-sandbox")
     
-    # 设置分辨率 (伪装成普通显示器)
+    # 伪装分辨率
     options.add_argument("--window-size=1920,1080")
     
-    # 设置用户目录到 /tmp，避免在 /app 目录下出现权限问题
+    # 指定用户目录到 /tmp (解决 Docker 权限报错的关键)
     options.add_argument(f"--user-data-dir={data_dir}")
     
-    # 随机 User-Agent (这是 Windows 10 Chrome 的 UA，伪装性好)
-    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    # 设置 Windows User-Agent
+    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
 
     driver = None
     try:
-        logging.info(">>> 正在启动 Undetected Chrome (这可能需要几秒钟)...")
+        print(">>> [步骤3] 正在启动浏览器 (Undetected Chrome)...")
+        logging.info("初始化驱动中，这可能需要几十秒下载驱动...")
         
-        # 【核心初始化】
-        # version_main=None: 让库自动寻找安装好的 Chrome 版本
-        # use_subprocess=True: 必须开启，防止 Docker 中进程死锁
+        # 【驱动初始化】
+        # use_subprocess=True: 必须开启，防止 Docker 僵尸进程
+        # version_main=None: 自动匹配版本
         driver = uc.Chrome(
             options=options,
             version_main=None,
             use_subprocess=True,
-            headless=True # 在这里显式指定 headless
+            headless=True
         )
         
-        logging.info(">>> 浏览器启动成功！")
+        logging.info(">>> 浏览器启动成功！开始处理任务...")
         
         # 3. 读取网址
         url_file = 'urls.txt'
@@ -72,10 +75,9 @@ def run_automation():
             logging.warning("警告: urls.txt 是空的")
             return
 
-        # 4. 循环访问逻辑
+        # 4. 循环访问
         for index, url in enumerate(urls, 1):
             try:
-                # 补全 URL
                 if not url.startswith(('http://', 'https://')):
                     url = 'https://' + url
                 
@@ -84,36 +86,36 @@ def run_automation():
                 # 打开网页
                 driver.get(url)
                 
-                # --- 行为模拟 (欺骗统计代码) ---
+                # --- 模拟真人行为 (欺骗统计代码) ---
                 
-                # 1. 初始加载等待
-                time.sleep(random.uniform(3, 5))
+                # 随机停留等待加载
+                sleep_time = random.uniform(3, 6)
+                logging.info(f"    -> 页面加载中，等待 {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
                 
-                # 2. 模拟向下滚动 (触发懒加载和统计 JS)
-                logging.info("    -> 模拟鼠标滚动...")
+                # 模拟滚动 (触发懒加载)
+                logging.info("    -> 模拟滚动...")
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight/3);")
                 time.sleep(random.uniform(1, 2))
                 
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight/1.5);")
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight/1.2);")
                 time.sleep(random.uniform(1, 2))
                 
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 
-                # 3. 最后停留
-                wait_time = random.uniform(2, 4)
-                logging.info(f"    -> 停留 {wait_time:.1f} 秒")
-                time.sleep(wait_time)
+                # 最后的阅读停留
+                logging.info("    -> 停留浏览中...")
+                time.sleep(random.uniform(2, 4))
+                
+                logging.info(f"    -> 访问完成: {url}")
                 
             except Exception as e:
-                logging.error(f"访问 {url} 时出错: {str(e)}")
-                # 如果浏览器挂了，尝试重启或者跳过
+                logging.error(f"访问单条 URL 出错: {str(e)}")
                 continue
 
     except Exception as e:
-        logging.error(f"!!! 致命错误: {str(e)}")
-        # 打印详细堆栈以便调试
-        import traceback
-        traceback.print_exc()
+        # 这里只抛出异常，交给主函数处理打印
+        raise e
         
     finally:
         if driver:
@@ -122,11 +124,30 @@ def run_automation():
                 driver.quit()
             except:
                 pass
-        
-        # 5. 保活逻辑 (防止容器退出导致看不到日志)
-        logging.info("所有任务已结束。容器进入待机模式 (便于查看日志)...")
-        while True:
-            time.sleep(3600)
 
 if __name__ == "__main__":
-    run_automation()
+    print("="*50)
+    print(">>> 容器主程序启动")
+    print("="*50)
+    
+    try:
+        run_automation()
+        print("\n>>> 所有任务正常完成。")
+        
+    except Exception as e:
+        print("\n" + "!"*50)
+        print("!!! 程序运行期间发生崩溃 !!!")
+        print("错误详情如下 (请截图):")
+        print("-" * 30)
+        # 打印完整的错误堆栈，方便排查
+        traceback.print_exc()
+        print("-" * 30)
+        print("!"*50 + "\n")
+        
+    finally:
+        # 【核心保活逻辑】
+        # 无论成功还是失败，都进入死循环，防止 Pod 变为 Terminated
+        print(">>> 容器进入【无限待机模式】以保持 Logs 可见。")
+        print(">>> 你现在可以在控制台查看上方的报错信息了。")
+        while True:
+            time.sleep(3600)
