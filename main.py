@@ -3,157 +3,103 @@ import time
 import logging
 import random
 import sys
-import shutil
 import traceback
-import threading
-import requests
-import undetected_chromedriver as uc
-from selenium.common.exceptions import WebDriverException
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import InvalidArgumentException, WebDriverException
 
 # 1. 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-# 【配置项】
-# 核心修改：将重启间隔从 30 降低到 10，防止 100MB 磁盘写满
-RESTART_INTERVAL = 10 
-REMOTE_URLS_PATH = "https://raw.githubusercontent.com/wh1813/workflows/main/urls.txt"
+# --- 代理配置 (关键) ---
+# 如果您在本地电脑运行，v2rayN 默认 HTTP 端口通常是 10809 或 10808
+# 如果您在 Docker/云服务器运行，您不能直接用 127.0.0.1，具体请看代码下方的解释
+PROXY_IP = ""  # 例如 "127.0.0.1:10809"，留空则不使用代理
 
-# --- 虚拟 Web 服务器 (保活用) ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Alive")
-    def log_message(self, format, *args): pass
-
-def start_web_server():
-    try:
-        server = HTTPServer(('0.0.0.0', 80), HealthCheckHandler)
-        server.serve_forever()
-    except: pass
-
-# --- 爬虫逻辑 ---
-
-def update_source_code():
-    try:
-        resp = requests.get(REMOTE_URLS_PATH, timeout=10)
-        if resp.status_code == 200:
-            with open("urls.txt", "w", encoding="utf-8") as f:
-                f.write(resp.text)
-            logging.info("✅ 列表更新成功")
-    except: pass
-
-def get_chrome_options():
-    data_dir = "/tmp/chrome_user_data"
+def get_driver():
+    chrome_options = Options()
     
-    options = uc.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-setuid-sandbox")
-    options.add_argument("--window-size=1920,1080")
+    # Docker 环境必备参数
+    chrome_options.add_argument("--headless") # 无头模式
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
     
-    # 【核心修改】磁盘空间极简优化
-    options.add_argument("--disk-cache-size=1")  # 限制磁盘缓存仅 1 字节
-    options.add_argument("--media-cache-size=1") # 限制媒体缓存
-    options.add_argument("--disable-application-cache")
-    options.add_argument("--disable-offline-load-stale-cache")
-    options.add_argument("--incognito") # 尝试使用隐身模式减少数据写入
-    
-    options.add_argument(f"--user-data-dir={data_dir}")
-    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
-    return options
+    # 模拟真实浏览器 User-Agent
+    chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-def create_driver():
-    # 启动前强制清理垃圾
-    data_dir = "/tmp/chrome_user_data"
-    if os.path.exists(data_dir):
-        try: shutil.rmtree(data_dir, ignore_errors=True)
-        except: pass
-            
+    # --- 设置代理 ---
+    if PROXY_IP:
+        logging.info(f"正在配置代理: {PROXY_IP}")
+        chrome_options.add_argument(f'--proxy-server=http://{PROXY_IP}')
+
+    # Docker 中使用系统预装的驱动
+    service = Service(executable_path="/usr/bin/chromedriver")
+    
     try:
-        logging.info(">>> 启动新浏览器 (已优化存储)...")
-        driver = uc.Chrome(options=get_chrome_options(), version_main=None, use_subprocess=True, headless=True)
-        driver.set_page_load_timeout(60)
+        driver = webdriver.Chrome(service=service, options=chrome_options)
         return driver
     except Exception as e:
-        logging.error(f"创建驱动失败: {str(e)}")
+        logging.error(f"初始化失败: {e}")
         return None
 
-def close_driver(driver):
-    if driver:
-        try: driver.quit()
-        except: pass
-    # 关闭后再次清理垃圾，确保不残留
-    data_dir = "/tmp/chrome_user_data"
-    if os.path.exists(data_dir):
-        try: shutil.rmtree(data_dir, ignore_errors=True)
-        except: pass
+def run_task():
+    # 1. 读取 urls.txt
+    if not os.path.exists('urls.txt'):
+        logging.error("找不到 urls.txt 文件，请上传！")
+        return
 
-def run_automation():
-    update_source_code()
-    
-    url_file = 'urls.txt'
-    if not os.path.exists(url_file): return
+    with open('urls.txt', 'r', encoding='utf-8') as file:
+        urls = [line.strip() for line in file if line.strip()]
 
-    with open(url_file, 'r', encoding='utf-8') as f:
-        urls = [line.strip() for line in f if line.strip()]
+    if not urls:
+        logging.warning("urls.txt 是空的")
+        return
 
-    driver = create_driver()
-    if not driver: return
+    # 2. 启动浏览器
+    driver = get_driver()
+    if not driver:
+        return
 
-    for index, url in enumerate(urls, 1):
-        try:
-            # 每 10 个就重启清理一次，防止 100MB 爆满
-            if index % RESTART_INTERVAL == 0:
-                logging.info(f">>> 周期性清理 (已访问 {index} 个)...")
-                close_driver(driver)
-                time.sleep(2)
-                driver = create_driver()
-                if not driver: continue
+    try:
+        for i, url in enumerate(urls, 1):
+            try:
+                # 补全 URL
+                if not url.startswith(('http://', 'https://')):
+                    url = 'https://' + url
 
-            if not url.startswith(('http://', 'https://')): url = 'https://' + url
-            
-            logging.info(f"[{index}/{len(urls)}] {url}")
-            
-            if driver:
+                logging.info(f"[{i}/{len(urls)}] Opening: {url}")
                 driver.get(url)
-                # 稍微缩短停留时间，减少缓存生成
-                time.sleep(random.uniform(2, 4))
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-                time.sleep(1)
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(random.uniform(2, 4))
-            else:
-                raise WebDriverException("Driver丢失")
+                
+                # --- 核心修改：随机停留 4-7 秒 ---
+                sleep_time = random.uniform(4, 7)
+                logging.info(f"    -> 随机停留 {sleep_time:.2f} 秒...")
+                time.sleep(sleep_time)
 
-        except Exception as e:
-            logging.warning(f"错误重启: {str(e)}")
-            close_driver(driver)
-            time.sleep(3)
-            driver = create_driver()
-            continue
+            except InvalidArgumentException:
+                logging.error(f"无效 URL: {url}")
+            except Exception as e:
+                logging.error(f"访问错误: {e}")
+                
+                # 如果浏览器崩了，尝试重启
+                try:
+                    driver.quit()
+                except: pass
+                driver = get_driver()
 
-    close_driver(driver)
-    logging.info("任务完成")
+    finally:
+        if driver:
+            driver.quit()
+            logging.info("任务结束，浏览器已关闭")
 
 if __name__ == "__main__":
-    # 启动保活 Web Server
-    web_thread = threading.Thread(target=start_web_server, daemon=True)
-    web_thread.start()
-    time.sleep(2)
-    
-    try:
-        run_automation()
-    except Exception as e:
-        traceback.print_exc()
-    finally:
-        while True: time.sleep(3600)
+    # 为了防止 Docker 跑完退出，加个循环
+    while True:
+        run_task()
+        logging.info("所有网址访问完毕，休息 1 小时后重新开始...")
+        time.sleep(3600)
