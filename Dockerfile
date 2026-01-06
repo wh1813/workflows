@@ -7,12 +7,18 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
-# 3. 安装 Chromium 浏览器和驱动
-# 使用系统自带的包管理器安装，这是最稳定、体积最小的方案
+# 3. 安装依赖和官方 Google Chrome
+# 注意：这里换回了 google-chrome-stable，因为 undetected-chromedriver 需要它
 RUN apt-get update && apt-get install -y \
     wget \
-    chromium \
-    chromium-driver \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 下载并安装官方 Chrome (能解决依赖问题)
+RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get update \
+    && apt-get install -y ./google-chrome-stable_current_amd64.deb \
+    && rm google-chrome-stable_current_amd64.deb \
     && rm -rf /var/lib/apt/lists/*
 
 # 4. 安装 Python 库
@@ -22,7 +28,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 5. 复制代码
 COPY . .
 
-# 6. 暴露端口 (骗过云平台健康检查)
+# 6. 暴露端口 (配合 main.py 里的 Web Server 保活)
 EXPOSE 80
 
 # 7. 启动命令
