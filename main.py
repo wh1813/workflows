@@ -8,7 +8,6 @@ import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import WebDriverException
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # 1. 配置日志
@@ -18,89 +17,87 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-# --- 配置区 ---
-# GitHub 上 urls.txt 的 RAW 地址 (请确保这个地址是准确的)
+# GitHub 网址列表地址
 REMOTE_URLS_PATH = "https://raw.githubusercontent.com/wh1813/workflows/main/urls.txt"
-
-# 多少个网页重启一次浏览器 (防止内存溢出)
 RESTART_INTERVAL = 20
 
-# --- 模块1: 虚拟 Web 服务器 (防止云平台杀容器) ---
+# --- Web Server (保活) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"I am alive!")
+        self.wfile.write(b"Alive")
     def log_message(self, format, *args): pass
 
 def start_web_server():
     try:
-        # 监听 80 端口
         server = HTTPServer(('0.0.0.0', 80), HealthCheckHandler)
-        logging.info(">>> [系统] 保活 Web 服务器已启动 (Port 80)")
+        logging.info(">>> [系统] 保活服务已启动")
         server.serve_forever()
-    except Exception as e:
-        logging.warning(f">>> [警告] 80 端口可能被占用: {e}")
+    except: pass
 
-# --- 模块2: 自动更新 urls.txt ---
+# --- 自动更新 ---
 def update_urls_from_github():
-    print("-" * 50)
-    logging.info(">>> [自动更新] 正在从 GitHub 获取最新网址列表...")
     try:
+        logging.info(">>> 正在检查网址列表更新...")
         resp = requests.get(REMOTE_URLS_PATH, timeout=10)
         if resp.status_code == 200:
-            # 只有获取成功才覆盖本地文件
             with open("urls.txt", "w", encoding="utf-8") as f:
                 f.write(resp.text)
-            logging.info("✅ urls.txt 更新成功！")
-        else:
-            logging.error(f"❌ 下载失败，状态码: {resp.status_code}")
-    except Exception as e:
-        logging.error(f"❌ 更新出错 (可能是网络问题): {e}")
-    print("-" * 50)
+            logging.info("✅ 网址列表更新成功")
+    except: pass
 
-# --- 模块3: 浏览器控制 ---
+# --- 浏览器配置 (核心修改) ---
 def get_driver():
     options = Options()
-    # Docker 环境必须参数
-    options.add_argument("--headless") # 无头模式
+    options.add_argument("--headless") 
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
     
-    # 模拟 User-Agent (防止被认为是 Python 脚本)
+    # 【关键修改1】去除"受到自动化软件控制"的提示
+    # 这是绝大多数统计代码判断你是机器人的依据
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+
+    # 【关键修改2】伪造来源 (Referer)，假装是从百度搜索结果点进去的
+    # 很多网站不记录直接访问（空来源）的流量
+    options.add_argument("--referrer=https://www.baidu.com/")
+
+    # 伪造 User-Agent
     options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-    # Dockerfile 中安装的驱动路径
     service = Service(executable_path="/usr/bin/chromedriver")
     
     try:
         driver = webdriver.Chrome(service=service, options=options)
-        driver.set_page_load_timeout(30) # 页面加载超时限制
+        
+        # 【关键修改3】注入 JS 彻底移除 webdriver 特征
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+            Object.defineProperty(navigator, 'webdriver', {
+              get: () => undefined
+            })
+            """
+        })
+        
+        driver.set_page_load_timeout(30)
         return driver
     except Exception as e:
-        logging.error(f"浏览器初始化失败: {e}")
+        logging.error(f"浏览器启动失败: {e}")
         return None
 
 def run_automation():
-    # 1. 先尝试更新网址
     update_urls_from_github()
 
-    # 2. 读取网址
-    if not os.path.exists("urls.txt"):
-        logging.error("没有找到 urls.txt，请检查 GitHub 地址或文件上传")
-        return
-
+    if not os.path.exists("urls.txt"): return
     with open("urls.txt", "r", encoding="utf-8") as f:
         urls = [line.strip() for line in f if line.strip()]
 
-    if not urls:
-        logging.warning("urls.txt 是空的")
-        return
+    if not urls: return
 
-    logging.info(f">>> 开始执行任务，共 {len(urls)} 个网址")
-
-    # 3. 启动浏览器
     driver = get_driver()
     if not driver: return
 
@@ -110,58 +107,59 @@ def run_automation():
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
 
-            # 定期重启浏览器释放内存
+            # 定期重启
             if index % RESTART_INTERVAL == 0:
-                logging.info(">>> 正在重启浏览器以清理内存...")
+                logging.info(">>> 重启浏览器释放内存...")
                 driver.quit()
                 time.sleep(2)
                 driver = get_driver()
                 if not driver: break
 
-            logging.info(f"[{index}/{len(urls)}] 访问: {url}")
+            logging.info(f"[{index}/{len(urls)}] 准备访问: {url}")
             driver.get(url)
 
-            # --- 模拟真人行为 (关键计数逻辑) ---
+            # --- 【证据环节】 ---
+            # 打印网页标题，证明真的打开了
+            page_title = driver.title
+            logging.info(f"    ✅ 已打开网页，标题为: 【{page_title}】")
             
-            # 1. 稍微滚动一下 (触发很多懒加载的统计代码)
+            # 如果标题包含"验证"、"安全"、"403"等字眼，说明IP被封了
+            if any(k in page_title for k in ["验证", "安全检测", "403", "Forbidden", "Captcha"]):
+                logging.warning("    !!! 警告：可能触发了反爬拦截，IP 需要更换 !!!")
+            
+            # --- 模拟行为 ---
+            # 1. 稍微滚动
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight/3);")
             
-            # 2. 随机停留 4-7 秒 (您要求的)
-            sleep_time = random.uniform(4, 7)
-            logging.info(f"    -> 停留 {sleep_time:.2f} 秒 (模拟阅读)")
+            # 2. 随机停留 5-8 秒 (稍微加长一点)
+            sleep_time = random.uniform(5, 8)
             time.sleep(sleep_time)
             
-            # 3. 再滚到底部
+            # 3. 到底
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            
+            logging.info(f"    -> 模拟阅读完成 (停留 {sleep_time:.1f}s)")
 
         except Exception as e:
             logging.error(f"    -> 访问出错: {e}")
-            # 如果浏览器死机了，尝试重启
-            try:
-                driver.quit()
+            try: driver.quit()
             except: pass
             driver = get_driver()
             if not driver: break
             continue
 
-    if driver:
-        driver.quit()
-    logging.info(">>> 本轮任务全部完成")
+    if driver: driver.quit()
+    logging.info(">>> 本轮结束")
 
 if __name__ == "__main__":
-    # 1. 启动保活 Web Server (守护线程)
     web_thread = threading.Thread(target=start_web_server, daemon=True)
     web_thread.start()
-    
-    # 给一点时间让 Server 启动
     time.sleep(2)
 
-    # 2. 主循环
     while True:
         try:
             run_automation()
         except Exception as e:
             logging.error(f"主程序崩溃: {e}")
-        
-        logging.info(">>> 休息 10 分钟后开始下一轮...")
-        time.sleep(600)
+        logging.info(">>> 休息 5 分钟...")
+        time.sleep(300)
