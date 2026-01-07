@@ -10,7 +10,7 @@ import json
 import requests
 import urllib.parse
 import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By # 必须导入这个用于查找元素
+from selenium.webdriver.common.by import By  # 用于查找页面元素
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ================= 配置区域 =================
@@ -118,7 +118,6 @@ def start_xray_with_node(node_url):
         
         # 启动后立刻进行健康检查
         if check_proxy_connectivity():
-            # 简单打印一下节点信息（隐去敏感信息）
             logging.info(f"    -> [节点切换成功] 目标地址: {node['address']}")
             return True
         else:
@@ -176,7 +175,7 @@ def force_kill_chrome():
     subprocess.run("pkill -9 -f undetected_chromedriver", shell=True, stderr=subprocess.DEVNULL)
     subprocess.run("rm -rf /tmp/.org.chromium.*", shell=True, stderr=subprocess.DEVNULL)
 
-# --- 模块5: 浏览器配置 ---
+# --- 模块5: 浏览器配置 (已修复SSL报错) ---
 def get_driver():
     force_kill_chrome()
     data_dir = "/tmp/chrome_user_data"
@@ -190,7 +189,11 @@ def get_driver():
     options.add_argument("--window-size=1920,1080")
     options.add_argument(f"--user-data-dir={data_dir}")
     
-    # 【核心】强制走本地 Xray 代理
+    # 【新增】忽略 SSL 证书错误 (解决 IP 显示乱码的问题)
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--ignore-ssl-errors")
+    
+    # 强制走本地 Xray 代理
     options.add_argument("--proxy-server=http://127.0.0.1:10808")
 
     # 资源限制
@@ -253,6 +256,8 @@ def run_automation():
             if index % RESTART_INTERVAL == 1 or index == 1:
                 try:
                     driver.get("https://api.ipify.org")
+                    # 查找 body 元素前稍微等一下，防止加载未完成
+                    time.sleep(2)
                     current_ip = driver.find_element(By.TAG_NAME, "body").text
                     logging.info(f"    🔎 [身份查验] 当前公网IP: 【{current_ip}】")
                 except Exception as e:
@@ -303,7 +308,8 @@ if __name__ == "__main__":
     update_remote_files()
     if not rotate_proxy():
         logging.error("启动失败：xray.txt 无可用节点")
-        time.sleep(60) # 失败了睡一会防止死循环日志
+        # 失败了睡一会防止死循环日志
+        time.sleep(60)
     
     while True:
         try: run_automation()
