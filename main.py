@@ -10,6 +10,7 @@ import json
 import requests
 import urllib.parse
 import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By # 必须导入这个用于查找元素
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ================= 配置区域 =================
@@ -19,7 +20,7 @@ REMOTE_URLS_PATH = "https://raw.githubusercontent.com/wh1813/workflows/main/urls
 # 2. 节点列表的 GitHub Raw 地址 (一行一个 vless:// 链接)
 REMOTE_XRAY_PATH = "https://raw.githubusercontent.com/wh1813/workflows/main/xray.txt"
 
-# 3. 每访问多少个网页切换一次 IP
+# 3. 每访问多少个网页切换一次 IP (建议 50-100)
 RESTART_INTERVAL = 50
 # ===========================================
 
@@ -60,15 +61,15 @@ def parse_vless(url):
         logging.error(f"解析节点链接失败: {e}")
         return None
 
-# --- 模块2: 代理服务管理 (带健康检查) ---
+# --- 模块2: 代理服务管理 (Xray) ---
 def check_proxy_connectivity():
-    """测试当前代理是否通畅"""
+    """测试当前代理是否通畅 (访问百度)"""
     try:
-        # 尝试通过代理访问百度，超时设为 5 秒
         proxies = {
             "http": "http://127.0.0.1:10808",
             "https": "http://127.0.0.1:10808"
         }
+        # 5秒超时
         r = requests.get("https://www.baidu.com", proxies=proxies, timeout=5)
         if r.status_code == 200:
             return True
@@ -109,16 +110,19 @@ def start_xray_with_node(node_url):
     # 重启 Xray 进程
     subprocess.run("pkill -9 -f xray", shell=True, stderr=subprocess.DEVNULL)
     time.sleep(1)
+    
     try:
+        # 后台启动 xray
         subprocess.Popen(["xray", "-c", "config.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(2) # 等待启动
         
-        # 【关键】启动后立刻进行健康检查
+        # 启动后立刻进行健康检查
         if check_proxy_connectivity():
-            logging.info(f"    -> [检测通过] 节点可用: {node['address']}")
+            # 简单打印一下节点信息（隐去敏感信息）
+            logging.info(f"    -> [节点切换成功] 目标地址: {node['address']}")
             return True
         else:
-            logging.warning(f"    -> [检测失败] 节点无法联网，将跳过: {node['address']}")
+            logging.warning(f"    -> [节点不可用] 无法联网，跳过: {node['address']}")
             return False
             
     except Exception as e:
@@ -139,20 +143,20 @@ def rotate_proxy():
         logging.error("xray.txt 是空的")
         return False
 
-    # 随机打乱节点顺序，避免每次都从第一个开始试
+    # 随机打乱节点顺序
     random.shuffle(nodes)
 
     logging.info(f">>> [代理] 正在从 {len(nodes)} 个节点中寻找可用节点...")
 
     for node_url in nodes:
-        # 尝试启动并检查
+        # 尝试启动并检查，如果成功则直接返回
         if start_xray_with_node(node_url):
-            return True # 找到一个能用的，结束寻找
+            return True
     
     logging.error("!!! 所有节点均测试失败，请检查 xray.txt !!!")
     return False
 
-# --- 模块3: 自动更新 (支持 urls.txt 和 xray.txt) ---
+# --- 模块3: 自动更新 ---
 def update_remote_files():
     files = {
         "urls.txt": REMOTE_URLS_PATH,
@@ -166,13 +170,13 @@ def update_remote_files():
                 logging.info(f"✅ {filename} 更新成功")
         except: pass
 
-# --- 模块4: 强力清理 ---
+# --- 模块4: 强力清理 (防止僵尸进程) ---
 def force_kill_chrome():
     subprocess.run("pkill -9 -f chrome", shell=True, stderr=subprocess.DEVNULL)
     subprocess.run("pkill -9 -f undetected_chromedriver", shell=True, stderr=subprocess.DEVNULL)
     subprocess.run("rm -rf /tmp/.org.chromium.*", shell=True, stderr=subprocess.DEVNULL)
 
-# --- 模块5: 浏览器 ---
+# --- 模块5: 浏览器配置 ---
 def get_driver():
     force_kill_chrome()
     data_dir = "/tmp/chrome_user_data"
@@ -186,15 +190,19 @@ def get_driver():
     options.add_argument("--window-size=1920,1080")
     options.add_argument(f"--user-data-dir={data_dir}")
     
-    # 强制走本地 Xray 代理
+    # 【核心】强制走本地 Xray 代理
     options.add_argument("--proxy-server=http://127.0.0.1:10808")
 
+    # 资源限制
     options.add_argument("--disk-cache-size=1")
     options.add_argument("--media-cache-size=1")
+    
+    # 伪装
     options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
 
     try:
         driver = uc.Chrome(options=options, version_main=None, use_subprocess=True, headless=True)
+        # 伪装 Referer
         driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Referer": "https://www.baidu.com/link?url=KkKS"}})
         driver.set_page_load_timeout(60)
         return driver
@@ -208,11 +216,9 @@ def run_automation():
     # 1. 更新配置文件
     update_remote_files()
 
-    # 2. 确保有一个可用的代理正在运行
-    # 如果进程不存在，或者为了轮换 IP，我们需要重新启动代理
-    # 注意：这里我们简单判断，如果 xray 没运行，或者需要轮换，就执行 rotate_proxy
+    # 2. 确保代理运行 (如果进程不在，或者需要初始化，先转起来)
     if subprocess.call("pgrep -f xray > /dev/null", shell=True) != 0:
-        if not rotate_proxy(): return # 如果找不到可用节点，暂停任务
+        if not rotate_proxy(): return 
 
     if not os.path.exists("urls.txt"): return
     with open("urls.txt", "r") as f: urls = [l.strip() for l in f if l.strip()]
@@ -227,25 +233,38 @@ def run_automation():
         try:
             if not url.startswith('http'): url = 'https://' + url
 
-            # 【轮换逻辑】
+            # 【轮换逻辑】每 RESTART_INTERVAL 次重启并切换 IP
             if index % RESTART_INTERVAL == 0:
                 logging.info(f">>> [维护] 已访问 {index} 个，正在切换节点并重启...")
                 try: driver.quit()
                 except: pass
                 
-                # 尝试切换到一个新节点
+                # 切换节点
                 if not rotate_proxy():
-                    logging.error("没有可用节点，休息一会儿...")
+                    logging.error("没有可用节点，本轮中止")
                     break 
                 
                 driver = get_driver()
                 if not driver: break
+
+            # =======================================================
+            # 【验证当前 IP】
+            # 在启动后第1次，或者每次切换节点后的第1次，检查 IP
+            if index % RESTART_INTERVAL == 1 or index == 1:
+                try:
+                    driver.get("https://api.ipify.org")
+                    current_ip = driver.find_element(By.TAG_NAME, "body").text
+                    logging.info(f"    🔎 [身份查验] 当前公网IP: 【{current_ip}】")
+                except Exception as e:
+                    logging.warning(f"    ⚠️ 查IP超时 (不影响后续访问): {e}")
+            # =======================================================
 
             logging.info(f"[{index}/{len(urls)}] 访问: {url}")
             driver.get(url)
             
             logging.info(f"    ✅ 标题: 【{driver.title}】")
 
+            # 模拟行为
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight/3);")
             sleep_time = random.uniform(5, 8)
             time.sleep(sleep_time)
@@ -258,8 +277,8 @@ def run_automation():
             try: driver.quit()
             except: pass
             
-            # 如果访问出错 (可能是当前节点突然挂了)，立即尝试切换节点
-            logging.warning(">>> 检测到网络错误，尝试更换节点...")
+            # 如果报错，可能是当前节点挂了，尝试切换
+            logging.warning(">>> 检测到异常，尝试切换节点...")
             rotate_proxy()
             
             driver = get_driver()
@@ -269,7 +288,7 @@ def run_automation():
     except: pass
     force_kill_chrome()
 
-# --- 保活 ---
+# --- 保活 Web Server ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -277,11 +296,14 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
 
 if __name__ == "__main__":
+    # 启动 80 端口保活
     threading.Thread(target=HTTPServer(('0.0.0.0', 80), HealthCheckHandler).serve_forever, daemon=True).start()
     
-    # 首次启动先找一个好节点
+    # 首次启动时，先下载配置并找一个可用节点
     update_remote_files()
-    rotate_proxy()
+    if not rotate_proxy():
+        logging.error("启动失败：xray.txt 无可用节点")
+        time.sleep(60) # 失败了睡一会防止死循环日志
     
     while True:
         try: run_automation()
