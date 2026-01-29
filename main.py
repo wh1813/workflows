@@ -189,7 +189,7 @@ def get_driver():
     options.add_argument("--window-size=1920,1080")
     options.add_argument(f"--user-data-dir={data_dir}")
     
-    # 【新增】忽略 SSL 证书错误 (解决 IP 显示乱码的问题)
+    # 【新增】忽略 SSL 证书错误
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--ignore-ssl-errors")
     
@@ -204,7 +204,11 @@ def get_driver():
     options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
 
     try:
-        driver = uc.Chrome(options=options, version_main=None, use_subprocess=True, headless=True)
+        # =================================================================
+        # [核心修复] 强制指定驱动版本为 144，解决与最新版 145 不匹配的问题
+        # =================================================================
+        driver = uc.Chrome(options=options, version_main=144, use_subprocess=True, headless=True)
+        
         # 伪装 Referer
         driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Referer": "https://www.baidu.com/link?url=KkKS"}})
         driver.set_page_load_timeout(60)
