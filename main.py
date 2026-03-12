@@ -207,7 +207,7 @@ def get_driver():
         # =================================================================
         # [核心修复] 强制指定驱动版本为 144，解决与最新版 145 不匹配的问题
         # =================================================================
-        driver = uc.Chrome(options=options, version_main=144, use_subprocess=True, headless=True)
+        driver = uc.Chrome(options=options, version_main=146, use_subprocess=True, headless=True)
         
         # 伪装 Referer
         driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Referer": "https://www.baidu.com/link?url=KkKS"}})
