@@ -9,6 +9,7 @@ import subprocess
 import json
 import requests
 import urllib.parse
+import re
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By  # 用于查找页面元素
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -29,6 +30,23 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
+
+# --- 【新增】自动检测系统自带的 Chrome 版本 ---
+def get_chrome_version():
+    """获取系统安装的 Chrome 主版本号"""
+    try:
+        # 尝试通过命令行获取 Google Chrome 版本
+        result = subprocess.run(['google-chrome', '--version'], capture_output=True, text=True)
+        version_string = result.stdout.strip()
+        # 解析出主版本号，例如从 "Google Chrome 146.0.7680.71" 提取 "146"
+        match = re.search(r'Chrome/(\d+)', version_string)
+        if not match:
+            match = re.search(r'Google Chrome (\d+)', version_string)
+        if match:
+            return int(match.group(1))
+    except Exception as e:
+        logging.warning(f"无法自动检测 Chrome 版本，将使用备用版本号: {e}")
+    return 146  # 默认降级方案
 
 # --- 模块1: VLESS 链接解析器 ---
 def parse_vless(url):
@@ -169,17 +187,23 @@ def update_remote_files():
                 logging.info(f"✅ {filename} 更新成功")
         except: pass
 
-# --- 模块4: 强力清理 (防止僵尸进程) ---
+# --- 模块4: 强力清理 (防止僵尸进程及缓存冲突) ---
 def force_kill_chrome():
     subprocess.run("pkill -9 -f chrome", shell=True, stderr=subprocess.DEVNULL)
     subprocess.run("pkill -9 -f undetected_chromedriver", shell=True, stderr=subprocess.DEVNULL)
     subprocess.run("rm -rf /tmp/.org.chromium.*", shell=True, stderr=subprocess.DEVNULL)
+    # 删除 undetected_chromedriver 的历史缓存驱动，强制重新下载匹配当前浏览器的驱动
+    subprocess.run("rm -rf ~/.local/share/undetected_chromedriver", shell=True, stderr=subprocess.DEVNULL)
+    subprocess.run("rm -rf /root/.local/share/undetected_chromedriver", shell=True, stderr=subprocess.DEVNULL)
 
-# --- 模块5: 浏览器配置 (已修复SSL报错) ---
+# --- 模块5: 浏览器配置 (已修复SSL报错 & 自动版本适配) ---
 def get_driver():
     force_kill_chrome()
     data_dir = "/tmp/chrome_user_data"
     if os.path.exists(data_dir): shutil.rmtree(data_dir, ignore_errors=True)
+
+    # 获取当前系统的 Chrome 主版本号
+    chrome_major_version = get_chrome_version()
 
     options = uc.ChromeOptions()
     options.add_argument("--headless=new")
@@ -189,7 +213,7 @@ def get_driver():
     options.add_argument("--window-size=1920,1080")
     options.add_argument(f"--user-data-dir={data_dir}")
     
-    # 【新增】忽略 SSL 证书错误
+    # 忽略 SSL 证书错误
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--ignore-ssl-errors")
     
@@ -200,14 +224,13 @@ def get_driver():
     options.add_argument("--disk-cache-size=1")
     options.add_argument("--media-cache-size=1")
     
-    # 伪装
-    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+    # 【深度优化】动态伪装 User-Agent
+    user_agent = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_major_version}.0.0.0 Safari/537.36"
+    options.add_argument(f"--user-agent={user_agent}")
 
     try:
-        # =================================================================
-        # [核心修复] 强制指定驱动版本为 144，解决与最新版 145 不匹配的问题
-        # =================================================================
-        driver = uc.Chrome(options=options, version_main=146, use_subprocess=True, headless=True)
+        # 动态传入 version_main
+        driver = uc.Chrome(options=options, version_main=chrome_major_version, use_subprocess=True, headless=True)
         
         # 伪装 Referer
         driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Referer": "https://www.baidu.com/link?url=KkKS"}})
@@ -254,19 +277,15 @@ def run_automation():
                 driver = get_driver()
                 if not driver: break
 
-            # =======================================================
             # 【验证当前 IP】
-            # 在启动后第1次，或者每次切换节点后的第1次，检查 IP
             if index % RESTART_INTERVAL == 1 or index == 1:
                 try:
                     driver.get("https://api.ipify.org")
-                    # 查找 body 元素前稍微等一下，防止加载未完成
                     time.sleep(2)
                     current_ip = driver.find_element(By.TAG_NAME, "body").text
                     logging.info(f"    🔎 [身份查验] 当前公网IP: 【{current_ip}】")
                 except Exception as e:
                     logging.warning(f"    ⚠️ 查IP超时 (不影响后续访问): {e}")
-            # =======================================================
 
             logging.info(f"[{index}/{len(urls)}] 访问: {url}")
             driver.get(url)
@@ -286,7 +305,6 @@ def run_automation():
             try: driver.quit()
             except: pass
             
-            # 如果报错，可能是当前节点挂了，尝试切换
             logging.warning(">>> 检测到异常，尝试切换节点...")
             rotate_proxy()
             
@@ -312,7 +330,6 @@ if __name__ == "__main__":
     update_remote_files()
     if not rotate_proxy():
         logging.error("启动失败：xray.txt 无可用节点")
-        # 失败了睡一会防止死循环日志
         time.sleep(60)
     
     while True:
