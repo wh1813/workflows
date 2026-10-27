@@ -1,3 +1,4 @@
 undetected-chromedriver>=3.5.0
 selenium>=4.10.0
 requests
+curl_cffi
