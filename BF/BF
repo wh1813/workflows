@@ -1,1 +1,1391 @@
+import os
+import sys
+import re
+import io
+import csv
+import time
+import json
+import stat
+import socket
+import random
+import shutil
+import base64
+import tarfile
+import logging
+import zipfile
+import subprocess
+import urllib.parse
+import urllib.request
+import concurrent.futures
+from datetime import datetime, timezone, timedelta
+from itertools import cycle
+import requests
+import urllib3
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
+# ==================== 0. 核心绝对路径配置 ====================
+CONTAINER_DIR = "/home/container" if os.path.exists("/home/container") else os.path.abspath(".")
+os.chdir(CONTAINER_DIR)
+
+WORK_TMP_DIR = os.path.join(CONTAINER_DIR, "runtime_tmp")
+BROWSER_ENV_DIR = os.path.join(CONTAINER_DIR, "lite_browser")
+LIB_DIR = os.path.join(BROWSER_ENV_DIR, "lib_flat")
+
+os.makedirs(WORK_TMP_DIR, exist_ok=True)
+os.makedirs(BROWSER_ENV_DIR, exist_ok=True)
+os.makedirs(LIB_DIR, exist_ok=True)
+
+os.environ["TMPDIR"] = WORK_TMP_DIR
+os.environ["TEMP"] = WORK_TMP_DIR
+os.environ["TMP"] = WORK_TMP_DIR
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSER_ENV_DIR
+os.environ["LD_LIBRARY_PATH"] = f"{LIB_DIR}:" + os.environ.get("LD_LIBRARY_PATH", "")
+os.environ["PATH"] = f"{CONTAINER_DIR}:{BROWSER_ENV_DIR}:" + os.environ.get("PATH", "")
+
+LOCAL_URLS_FILE = os.path.join(CONTAINER_DIR, "urls.txt")
+LOCAL_XRAY_FILE = os.path.join(CONTAINER_DIR, "xray.txt")
+LOCAL_COOKIE_FILE = os.path.join(CONTAINER_DIR, "cookie.txt")
+CSV_OUTPUT_FILE = os.path.join(CONTAINER_DIR, "book118_后台已审核文档汇总.csv")
+CRAWL_STATE_FILE = os.path.join(CONTAINER_DIR, "last_crawl_date.txt")
+
+# ==================== 1. 核心运行参数配置 ====================
+DAILY_CRAWL_HOUR_BJT = 9          # 每天北京时间 09:00 以后触发定时爬虫
+CRAWL_MAX_CLICKS = 10             # 筛选点击数 < 10 的文档更新进 urls.txt
+CRAWL_MIN_PAGES = 30              # 爬虫最少抓取页数下限（30页）
+CRAWL_MAX_PAGES = 50              # 爬虫最多抓取页数上限（50页）
+RUN_CRAWLER_ON_STARTUP = True     # 启动时若今日未爬过，则执行一次爬虫校验
+AUTO_RESTART_AFTER_UPDATE = True  # 更新完 urls.txt 后自动重启进程加载新队列
+COOKIE_KEEPALIVE_SECONDS = 3600   # 1 小时发送一次心跳保活
+
+DEFAULT_COOKIE_STR = os.environ.get(
+    "BOOK118_COOKIE",
+    "PHPSESSID=rmvgdvttv5cs1ksvca232q3cfs; return_url=http%3A%2F%2Fmax.book118.com%2Fuser_center_v1%2Fuser%2Findex%2Findex.html; 94ca48fd8a42333b_code_getgraphcode=1794188005%2C1; 94ca48fd8a42333b_login_passwordlogin=1794188007%2C1; max_u_token=84bd8e594109589132ecbbb9b9275477; Hm_lvt_f32e81852cb54f29133561587adb93c1=1794188083; HMACCOUNT=59B013A2C7B5BFAD; s_v=cdh%3D%3Ec865f4f0%7C%7C%7Cvid%3D%3E1794188090689119029%7C%7C%7Cfsts%3D%3E1794188090%7C%7C%7Cdsfs%3D%3E0%7C%7C%7Cnps%3D%3E1; s_rfd=cdh%3D%3Ec865f4f0%7C%7C%7Ctrd%3D%3Emax.book118.com%7C%7C%7Cftrd%3D%3Ebook118.com; s_s=cdh%3D%3Ec865f4f0%7C%7C%7Clast_req%3D%3E1794188090%7C%7C%7Csid%3D%3E1794188090501127806%7C%7C%7Cdsps%3D%3E0; CLIENT_SYS_UN_ID=wKh2E2rxIvpfrwt2SzFNAg==; UPLOAD_AGREEMENT_CHECKED=1; operation_user_center=1; Hm_lpvt_f32e81852cb54f29133561587adb93c1=1794191937"
+)
+
+BOOK118_BASE_URL = "https://max.book118.com"
+BOOK118_START_URL = (
+    "https://max.book118.com/user_center_v1/doc/Doclist/audited/"
+    "type/all/folder/all/format/all/uploadTime/all/orderField/default/"
+    "orderAsc/asc/pageSize/50/page/1/commend/all/pagenumber/all/"
+    "checkType/all/optimization/all/optimization_status/0/privateType/all/"
+    "baseType/0/failType/0/applyState/0/risk_typeid/all/titleIllegal/all/"
+    "contentIllegal/all/vipType/all.html"
+)
+
+SUBSCRIPTION_SOURCES = [
+    "订阅节点1",
+    "订阅节点2",
+    "订阅节点3",
+    "订阅节点4",
+    "订阅节点5",
+    "订阅节点6"
+]
+
+SUB_UPDATE_INTERVAL_ROUNDS = 3
+INTERVAL_SECONDS_MIN = 6
+INTERVAL_SECONDS_MAX = 10
+NODE_SWITCH_MIN_URLS = 5
+NODE_SWITCH_MAX_URLS = 8
+SWITCH_PROXY_EACH_URL = False
+
+MAX_VALID_NODES_POOL = 15
+ROUND_INTERVAL = 10
+FORCE_RECHECK_ROUNDS = 8
+
+RAW_TCP_PRECHECK_TIMEOUT = 2.0
+TCP_PRECHECK_WORKERS = 16
+XRAY_VERSION_TAG = os.environ.get("XRAY_VERSION_TAG", "v1.8.24")
+
+LOCAL_SOCKS_PORT = 10808
+LOCAL_HTTP_PORT = 10809
+XRAY_CONFIG_PATH = os.path.join(WORK_TMP_DIR, "xray_active_config.json")
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+
+# ==================== 模块1: 依赖自愈与精简浏览器部署 ====================
+def ensure_bs4_installed():
+    try:
+        import bs4
+    except ImportError:
+        logger.info("📦 正在安装轻量级 HTML 解析库 beautifulsoup4...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "beautifulsoup4", "--no-cache-dir", "-q"], check=False)
+
+
+def extract_deb_pure_python(deb_bytes, target_flat_lib_dir):
+    if not deb_bytes.startswith(b"!<arch>\n"):
+        return 0
+    pos = 8
+    extracted_count = 0
+    while pos + 60 <= len(deb_bytes):
+        header = deb_bytes[pos:pos + 60]
+        name = header[0:16].decode("ascii", errors="ignore").strip().rstrip("/")
+        size_str = header[48:58].decode("ascii", errors="ignore").strip()
+        if not size_str.isdigit():
+            break
+        size = int(size_str)
+        data_start = pos + 60
+        data_end = data_start + size
+        payload = deb_bytes[data_start:data_end]
+
+        if name.startswith("data.tar"):
+            try:
+                with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as tar:
+                    for member in tar.getmembers():
+                        base_name = os.path.basename(member.name)
+                        if ".so" in base_name:
+                            dst_path = os.path.join(target_flat_lib_dir, base_name)
+                            if member.isfile():
+                                f_obj = tar.extractfile(member)
+                                if f_obj:
+                                    with open(dst_path, "wb") as out_f:
+                                        out_f.write(f_obj.read())
+                                    os.chmod(dst_path, 0o755)
+                                    extracted_count += 1
+                            elif member.issym() or member.islnk():
+                                link_target_base = os.path.basename(member.linkname)
+                                try:
+                                    if os.path.lexists(dst_path):
+                                        os.remove(dst_path)
+                                    os.symlink(link_target_base, dst_path)
+                                except Exception:
+                                    pass
+            except Exception:
+                pass
+        pos = data_end + (size % 2)
+    return extracted_count
+
+
+def resolve_and_download_missing_libs(binary_path):
+    def _check_missing():
+        env = os.environ.copy()
+        env["LD_LIBRARY_PATH"] = f"{LIB_DIR}:" + env.get("LD_LIBRARY_PATH", "")
+        res = subprocess.run(["ldd", binary_path], capture_output=True, text=True, env=env)
+        return [line.split("=>")[0].strip() for line in res.stdout.splitlines() if "not found" in line]
+
+    missing = _check_missing()
+    if not missing:
+        logger.info("✅ [动态库自检] 精简浏览器所需的全部 Linux .so 库均已就绪！")
+        return True
+
+    logger.info("┌" + "─" * 58)
+    logger.info(f"│ 🔧 [动态库自愈] 检测到缺失 {len(missing)} 个底层库，正在从 Debian 源补齐...")
+    logger.info("└" + "─" * 58)
+
+    required_pkgs = {
+        "libnss3", "libnspr4", "libsqlite3-0", "libglib2.0-0", "libdbus-1-3",
+        "libatk1.0-0", "libatk-bridge2.0-0", "libatspi2.0-0", "libcups2",
+        "libdrm2", "libgbm1", "libxkbcommon0", "libxcomposite1", "libxdamage1",
+        "libxfixes3", "libxrandr2", "libpango-1.0-0", "libpangocairo-1.0-0",
+        "libcairo2", "libasound2", "libxcb1", "libx11-6", "libx11-xcb1",
+        "libxext6", "libxi6", "libxtst6", "libexpat1", "libwayland-server0",
+        "libwayland-client0", "libpciaccess0", "libxrender1", "libxshmfence1",
+        "libpixman-1-0", "libfontconfig1", "libfreetype6", "libfribidi0",
+        "libharfbuzz0b", "libthai0", "libdatrie1", "libgraphite2-3", "libpng16-16",
+        "libavahi-common3", "libavahi-client3"
+    }
+
+    mirror_base = "http://deb.debian.org/debian"
+    pkg_index_url = f"{mirror_base}/dists/bookworm/main/binary-amd64/Packages.xz"
+
+    try:
+        import lzma
+        r = requests.get(pkg_index_url, timeout=20)
+        index_text = lzma.decompress(r.content).decode("utf-8", errors="ignore")
+
+        pkg_to_filename = {}
+        current_pkg = None
+        for line in index_text.splitlines():
+            if line.startswith("Package: "):
+                current_pkg = line[9:].strip()
+            elif line.startswith("Filename: ") and current_pkg in required_pkgs:
+                pkg_to_filename[current_pkg] = line[10:].strip()
+                current_pkg = None
+
+        def _dl_and_extract(item):
+            _, rel_path = item
+            try:
+                resp = requests.get(f"{mirror_base}/{rel_path}", timeout=15)
+                if resp.status_code == 200:
+                    return extract_deb_pure_python(resp.content, LIB_DIR)
+            except Exception:
+                pass
+            return 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_dl_and_extract, pkg_to_filename.items()))
+        logger.info("   ✅ 动态链接库补齐解压完成！")
+    except Exception as e:
+        logger.warning(f"   ⚠️ 依赖库自动补齐部分跳过: {e}")
+    return True
+
+
+def ensure_lite_headless_browser():
+    ensure_bs4_installed()
+    old_bad_dir = os.path.join(CONTAINER_DIR, " runtime_tmp")
+    if os.path.exists(old_bad_dir):
+        shutil.rmtree(old_bad_dir, ignore_errors=True)
+
+    try:
+        import playwright
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "playwright", "--no-cache-dir", "-q"], check=False)
+
+    def _find_real_binary():
+        for root, _, files in os.walk(BROWSER_ENV_DIR):
+            for f in files:
+                if f in ("chrome-headless-shell", "headless_shell"):
+                    p = os.path.join(root, f)
+                    os.chmod(p, 0o755)
+                    return p
+        return None
+
+    real_bin = _find_real_binary()
+    if not real_bin:
+        logger.info("🚀 正在下载精简版 chromium-headless-shell 内核...")
+        res = subprocess.run([sys.executable, "-m", "playwright", "install", "--only-shell", "chromium"], env=os.environ)
+        if res.returncode != 0:
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], env=os.environ)
+        real_bin = _find_real_binary()
+
+    if not real_bin:
+        raise RuntimeError("未能找到 chrome-headless-shell 二进制文件")
+
+    resolve_and_download_missing_libs(real_bin)
+
+    wrapper_path = os.path.join(BROWSER_ENV_DIR, "run_headless_wrapper.sh")
+    wrapper_content = f"""#!/bin/sh
+export LD_LIBRARY_PATH="{LIB_DIR}:$LD_LIBRARY_PATH"
+exec "{real_bin}" "$@"
+"""
+    with open(wrapper_path, "w", encoding="utf-8") as f:
+        f.write(wrapper_content)
+    os.chmod(wrapper_path, 0o755)
+    return wrapper_path
+
+
+# ==================== 模块2: Cookie动态加载、保活与30~50页随机爬虫 ====================
+def get_beijing_now():
+    bjt_tz = timezone(timedelta(hours=8))
+    return datetime.now(bjt_tz)
+
+
+def get_last_crawl_date():
+    if os.path.exists(CRAWL_STATE_FILE):
+        try:
+            with open(CRAWL_STATE_FILE, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return ""
+
+
+def save_last_crawl_date(date_str):
+    try:
+        with open(CRAWL_STATE_FILE, "w", encoding="utf-8") as f:
+            f.write(date_str)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+
+
+def load_latest_cookie_str():
+    if os.path.exists(LOCAL_COOKIE_FILE):
+        try:
+            with open(LOCAL_COOKIE_FILE, "r", encoding="utf-8") as f:
+                c = f.read().strip()
+                if c and "=" in c:
+                    return c
+        except Exception:
+            pass
+    return DEFAULT_COOKIE_STR.strip()
+
+
+def _parse_cookie_str(cookie_str):
+    cookie_dict = {}
+    for item in cookie_str.split(";"):
+        item = item.strip()
+        if "=" in item:
+            k, v = item.split("=", 1)
+            cookie_dict[k.strip()] = v.strip()
+    return cookie_dict
+
+
+def keepalive_book118_cookie():
+    cookie_str = load_latest_cookie_str()
+    if not cookie_str:
+        return
+    try:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Referer": "https://max.book118.com/user_center_v1/doc/index/index.html",
+            "X-Requested-With": "XMLHttpRequest",
+        })
+        requests.utils.add_dict_to_cookiejar(session.cookies, _parse_cookie_str(cookie_str))
+        r = session.get(BOOK118_START_URL, timeout=12, verify=False)
+        if r.status_code == 200 and '"code":20000' not in r.text:
+            logger.info("💓 [Cookie保活] 后台登录会话心跳刷新成功，当前 Cookie 状态有效。")
+        else:
+            logger.warning("⚠️ [Cookie保活告警] 后台返回登录失效，请更新 /home/container/cookie.txt！")
+        session.close()
+    except Exception:
+        pass
+
+
+def _extract_all_html_from_resp(resp):
+    raw_text = resp.text
+    html_pieces = []
+
+    def walk_json(obj):
+        if isinstance(obj, str):
+            if "<tr" in obj or "col-title" in obj or "<a " in obj or "下一页" in obj:
+                html_pieces.append(obj)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                walk_json(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk_json(item)
+
+    try:
+        data = resp.json()
+        walk_json(data)
+        if html_pieces:
+            return "\n".join(html_pieces)
+    except Exception:
+        pass
+
+    if r'\"' in raw_text or r"\/" in raw_text:
+        try:
+            unescaped = raw_text.encode("utf-8").decode("unicode_escape")
+            if "col-title" in unescaped or "data-aid" in unescaped:
+                return unescaped
+        except Exception:
+            pass
+        return raw_text.replace(r'\"', '"').replace(r"\/", "/")
+
+    return raw_text
+
+
+def _parse_book118_page(html_content):
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html_content, "html.parser")
+    doc_list = []
+
+    rows = soup.find_all("tr", attrs={"data-aid": True})
+    if not rows:
+        for a_tag in soup.select("td.col-title a.title"):
+            tr_parent = a_tag.find_parent("tr")
+            if tr_parent and tr_parent not in rows:
+                rows.append(tr_parent)
+
+    for row in rows:
+        doc_id = row.get("data-aid", "").strip()
+        if not doc_id:
+            checkbox = row.select_one("input[type='checkbox']")
+            doc_id = checkbox.get("value", "").strip() if checkbox else ""
+
+        title_tag = row.select_one("td.col-title a.title")
+        if title_tag:
+            title = title_tag.get("title") or title_tag.get_text(strip=True)
+            href = title_tag.get("href", "")
+            full_url = urllib.parse.urljoin(BOOK118_BASE_URL, href)
+        else:
+            title = row.get("data-title", "").strip()
+            full_url = ""
+
+        row_classes = row.get("class", [])
+        is_recommend = "已推荐" if "is-recommend" in row_classes else "未推荐"
+
+        click_tag = row.select_one("td.col-click")
+        clicks = click_tag.get_text(strip=True) if click_tag else "0"
+
+        coins = row.select("td.col-coin")
+        ori_coin = coins[0].get_text(strip=True) if len(coins) > 0 else ""
+        cur_price = coins[1].get_text(strip=True) if len(coins) > 1 else ""
+
+        size_tag = row.select_one("td.col-size")
+        page_tag = row.select_one("td.col-pagenumber")
+        time_tag = row.select_one("td.col-time")
+
+        molds = row.select("td.col-mold")
+        category = molds[0].get_text(strip=True) if len(molds) > 0 else ""
+        audit_status = molds[1].get_text(strip=True) if len(molds) > 1 else ""
+
+        doc_list.append({
+            "文档ID": doc_id,
+            "文档标题": title,
+            "文档链接": full_url,
+            "推荐状态": is_recommend,
+            "点击量": clicks,
+            "金币": ori_coin,
+            "现价": cur_price,
+            "大小": size_tag.get_text(strip=True) if size_tag else "",
+            "页数": page_tag.get_text(strip=True) if page_tag else "",
+            "上传时间": time_tag.get_text(strip=True) if time_tag else "",
+            "分类": category,
+            "状态": audit_status
+        })
+
+    next_url = None
+    next_tag = soup.find("a", string=lambda text: text and "下一页" in text)
+    if next_tag:
+        next_href = next_tag.get("href", "").strip()
+        if next_href and not next_href.startswith("javascript"):
+            next_url = urllib.parse.urljoin(BOOK118_BASE_URL, next_href)
+
+    return doc_list, next_url
+
+
+def _append_docs_to_csv(docs, csv_file=CSV_OUTPUT_FILE):
+    if not docs:
+        return
+    fieldnames = [
+        "文档ID", "文档标题", "文档链接", "推荐状态", "点击量",
+        "金币", "现价", "大小", "页数", "上传时间", "分类", "状态"
+    ]
+    file_exists = os.path.isfile(csv_file)
+    with open(csv_file, mode="a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(docs)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def run_book118_crawler_and_update_urls(use_proxy=False, urls_file=LOCAL_URLS_FILE):
+    bjt_str = get_beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+    cookie_str = load_latest_cookie_str()
+    target_max_pages = random.randint(CRAWL_MIN_PAGES, CRAWL_MAX_PAGES)
+
+    logger.info("\n" + "★" * 60)
+    logger.info(f"⏰ [爬虫任务启动] 北京时间: {bjt_str}")
+    logger.info(f"📂 目标写入绝对路径: {os.path.abspath(urls_file)}")
+    logger.info(f"🍪 Cookie 来源: {'/home/container/cookie.txt' if os.path.exists(LOCAL_COOKIE_FILE) else '代码内置 DEFAULT_COOKIE_STR'}")
+    logger.info(f"🕷️ 本次随机设定抓取前 {target_max_pages} 页 (范围:{CRAWL_MIN_PAGES}~{CRAWL_MAX_PAGES}页)，筛选点击量 < {CRAWL_MAX_CLICKS} 的链接...")
+    logger.info("★" * 60)
+
+    if os.path.exists(CSV_OUTPUT_FILE):
+        try:
+            os.remove(CSV_OUTPUT_FILE)
+        except Exception:
+            pass
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer": "https://max.book118.com/user_center_v1/doc/index/index.html",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/javascript, text/html, */*; q=0.01",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    })
+    requests.utils.add_dict_to_cookiejar(session.cookies, _parse_cookie_str(cookie_str))
+
+    proxies = {
+        "http": f"http://127.0.0.1:{LOCAL_HTTP_PORT}",
+        "https": f"http://127.0.0.1:{LOCAL_HTTP_PORT}"
+    } if use_proxy else None
+
+    current_url = BOOK118_START_URL
+    total_count = 0
+    low_click_urls = []
+    page_num = 1
+
+    channel_order = [None, proxies] if use_proxy else [None]
+
+    while current_url and page_num <= target_max_pages:
+        logger.info(f"   📄 [爬虫进度 {page_num}/{target_max_pages}] 正在抓取后台第 {page_num} 页...")
+        resp = None
+        last_err = None
+        for ch_proxy in channel_order:
+            try:
+                r = session.get(current_url, proxies=ch_proxy, timeout=18, verify=False)
+                if r.status_code == 200 and len(r.text.strip()) > 30:
+                    resp = r
+                    break
+            except Exception as e:
+                last_err = e
+                continue
+
+        if resp is None:
+            logger.error(f"   ❌ 抓取第 {page_num} 页网络请求失败 ({last_err})，停止翻页。")
+            break
+
+        try:
+            resp.encoding = "utf-8"
+            html_content = _extract_all_html_from_resp(resp)
+            docs, next_url = _parse_book118_page(html_content)
+
+            if not docs:
+                snippet = re.sub(r"\s+", " ", resp.text[:350])
+                logger.warning(f"   ⚠️ 第 {page_num} 页未提取到文档 | 响应内容: {snippet}")
+                if "登录失效" in snippet or "login" in snippet.lower():
+                    logger.error(
+                        "   🚨 [请更新 Cookie] 当前 Cookie 已过期！请在电脑浏览器按 F12 复制最新 Cookie，"
+                        "粘贴到容器的 /home/container/cookie.txt 文件中保存！"
+                    )
+                break
+
+            _append_docs_to_csv(docs, CSV_OUTPUT_FILE)
+            total_count += len(docs)
+
+            page_qualified = 0
+            for d in docs:
+                raw_click = str(d.get("点击量", "0")).strip()
+                digits = re.findall(r"\d+", raw_click)
+                click_val = int(digits[0]) if digits else 0
+                doc_url = d.get("文档链接", "").strip()
+
+                if click_val < CRAWL_MAX_CLICKS and doc_url:
+                    if not doc_url.startswith(("http://", "https://")):
+                        doc_url = "https://" + doc_url
+                    low_click_urls.append(doc_url)
+                    page_qualified += 1
+
+            logger.info(
+                f"      └─ 第 {page_num}/{target_max_pages} 页成功提取 {len(docs)} 条 | 本页点击<{CRAWL_MAX_CLICKS}: {page_qualified} 条 "
+                f"(累计达标 {len(low_click_urls)}/{total_count} 条)"
+            )
+
+            if page_num >= target_max_pages:
+                logger.info(f"   🛑 已达到本次设定的最大爬取页数上限 ({target_max_pages} 页)，停止翻页并立即转入点击模拟！")
+                break
+
+            if not next_url or next_url == current_url:
+                logger.info("   ✅ 后台全部页面抓取完毕！")
+                break
+
+            current_url = next_url
+            page_num += 1
+            time.sleep(1.5)
+
+        except Exception as e:
+            logger.error(f"   ❌ 解析第 {page_num} 页时发生错误: {e}")
+            break
+
+    session.close()
+
+    unique_qualified = list(dict.fromkeys(low_click_urls))
+    if unique_qualified:
+        tmp_urls_file = urls_file + ".tmp"
+        with open(tmp_urls_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(unique_qualified) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_urls_file, urls_file)
+
+        logger.info("★" * 60)
+        logger.info(
+            f"🎉 [urls.txt 强制落盘成功] 共扫描前 {page_num} 页 ({total_count} 篇文档)，"
+            f"已将 {len(unique_qualified)} 条点击量 < {CRAWL_MAX_CLICKS} 的链接写入: {urls_file}"
+        )
+        logger.info("★" * 60 + "\n")
+        return True
+    else:
+        existing_cnt = 0
+        if os.path.exists(urls_file):
+            with open(urls_file, "r", encoding="utf-8") as f:
+                existing_cnt = len([l for l in f if l.strip()])
+        logger.warning(
+            f"⚠️ [未更新 urls.txt] 本次爬虫共抓取 {total_count} 条文档，筛选出 0 条有效链接，"
+            f"继续保留原 {urls_file}（共 {existing_cnt} 行）。"
+        )
+        return False
+
+
+def restart_self_process():
+    logger.info("🔄 [自动重启生效] urls.txt 已更新，正在清理后台进程并自动重启主程序以立即加载新队列...")
+    try:
+        subprocess.run("pkill -9 -f chrome-headless-shell", shell=True, stderr=subprocess.DEVNULL)
+        subprocess.run("pkill -9 -f xray", shell=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    time.sleep(1.0)
+    os.environ["SKIP_STARTUP_CRAWL_ONCE"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# ==================== 模块3: Xray 环境与本地优先+订阅定期更新 ====================
+def kill_stray_processes():
+    subprocess.run("pkill -9 -f /home/container/xray", shell=True, stderr=subprocess.DEVNULL)
+    subprocess.run("pkill -9 -f xray", shell=True, stderr=subprocess.DEVNULL)
+    subprocess.run("pkill -9 -f chrome-headless-shell", shell=True, stderr=subprocess.DEVNULL)
+    time.sleep(0.2)
+
+
+def init_xray_env():
+    kill_stray_processes()
+    xray_bin = os.path.join(CONTAINER_DIR, "xray")
+    need_download = not os.path.exists(xray_bin) and not shutil.which("xray")
+    if not need_download and os.path.exists(xray_bin):
+        try:
+            res = subprocess.run([xray_bin, "version"], capture_output=True, text=True, timeout=5)
+            line = res.stdout.strip().splitlines()[0] if res.stdout.strip() else ""
+            if XRAY_VERSION_TAG.lstrip("v") not in line:
+                need_download = True
+        except Exception:
+            need_download = True
+
+    if need_download:
+        logger.info(f">>> [Xray准备] 正在下载部署 Xray ({XRAY_VERSION_TAG})...")
+        tmp_zip = os.path.join(WORK_TMP_DIR, "xray_dl.zip")
+        url = f"https://github.com/XTLS/Xray-core/releases/download/{XRAY_VERSION_TAG}/Xray-linux-64.zip"
+        try:
+            urllib.request.urlretrieve(url, tmp_zip)
+        except Exception:
+            url = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+            urllib.request.urlretrieve(url, tmp_zip)
+
+        with zipfile.ZipFile(tmp_zip, "r") as z:
+            z.extract("xray", CONTAINER_DIR)
+        os.chmod(xray_bin, 0o755)
+        if os.path.exists(tmp_zip):
+            os.remove(tmp_zip)
+        logger.info("✅ [Xray准备] Xray 内核安装完毕。")
+
+
+def read_local_xray_links(xray_file=LOCAL_XRAY_FILE):
+    if not os.path.exists(xray_file):
+        return []
+    with open(xray_file, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    if len(lines) == 1 and "://" not in lines[0]:
+        try:
+            raw = lines[0] + "=" * ((4 - len(lines[0]) % 4) % 4)
+            decoded = base64.b64decode(raw).decode("utf-8", errors="ignore")
+            lines = [l.strip() for l in decoded.splitlines() if l.strip() and not l.strip().startswith("#")]
+        except Exception:
+            pass
+    return list(dict.fromkeys(lines))
+
+
+def update_nodes_from_subscriptions(xray_file=LOCAL_XRAY_FILE, force_fetch=False):
+    local_links = read_local_xray_links(xray_file)
+
+    if local_links and not force_fetch:
+        logger.info(f"📂 [本地优先] 已直接读取 VPS 本地 {xray_file}，共 {len(local_links)} 个节点。")
+        return local_links
+
+    logger.info("┌" + "─" * 58)
+    logger.info(f"│ 🌐 [订阅更新] 正在从内置的 {len(SUBSCRIPTION_SOURCES)} 个订阅地址直接获取最新节点...")
+    logger.info("└" + "─" * 58)
+
+    sub_links = []
+
+    def _fetch_sub(url):
+        links = []
+        try:
+            r = requests.get(url, timeout=10, headers={"User-Agent": "v2rayN/6.23"})
+            if r.status_code == 200 and r.text.strip():
+                content = r.text.strip()
+                if "://" not in content:
+                    try:
+                        content += "=" * ((4 - len(content) % 4) % 4)
+                        content = base64.b64decode(content).decode("utf-8", errors="ignore")
+                    except Exception:
+                        pass
+                for line in content.splitlines():
+                    line = line.strip()
+                    if line and "://" in line and not line.startswith("#"):
+                        links.append(line)
+        except Exception:
+            pass
+        return links
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        for res in executor.map(_fetch_sub, SUBSCRIPTION_SOURCES):
+            sub_links.extend(res)
+
+    merged_links = list(dict.fromkeys(local_links + sub_links))
+    if merged_links:
+        with open(xray_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(merged_links) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        logger.info(
+            f"📥 [节点合并完成] 本地原有 {len(local_links)} 个 + 订阅获取 {len(sub_links)} 个 "
+            f"-> 去重后共保存 {len(merged_links)} 个节点至本地 {xray_file}"
+        )
+    else:
+        logger.warning(f"⚠️ 订阅未拉取到新节点，继续保留本地 {xray_file} 现有内容。")
+
+    return merged_links
+
+
+# ==================== 模块4: 多线程极速预检与节点池管理 ====================
+def raw_tcp_precheck(address, port, timeout=RAW_TCP_PRECHECK_TIMEOUT):
+    t0 = time.time()
+    try:
+        with socket.create_connection((address, port), timeout=timeout):
+            return True, int((time.time() - t0) * 1000)
+    except Exception:
+        return False, int((time.time() - t0) * 1000)
+
+
+def wait_port_open_or_dead(host, port, process, timeout=3.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if process.poll() is not None:
+            return False, True
+        try:
+            with socket.create_connection((host, port), timeout=0.2):
+                return True, False
+        except Exception:
+            time.sleep(0.1)
+    return False, (process.poll() is not None)
+
+
+class XrayProxyManager:
+    def __init__(self, xray_file=LOCAL_XRAY_FILE):
+        self.xray_file = xray_file
+        self.process = None
+        self.last_nodes_set = set()
+        self.valid_nodes = []
+        self.node_cycle = None
+        self.current_node = None
+
+    def _read_links_from_file(self):
+        return read_local_xray_links(self.xray_file)
+
+    def _parse_node_to_outbound(self, link):
+        if link.startswith("vmess://"):
+            b64 = link[8:].split("#")[0]
+            b64 += "=" * ((4 - len(b64) % 4) % 4)
+            conf = json.loads(base64.b64decode(b64).decode("utf-8", errors="ignore"))
+            address = conf.get("add")
+            port = int(conf.get("port", 443))
+            uid = conf.get("id")
+            net = conf.get("net", "tcp")
+            tls = conf.get("tls", "")
+            host = conf.get("host", "") or conf.get("sni", "") or address
+            path = conf.get("path", "/")
+            stream = {"network": net}
+            if tls == "tls":
+                stream["security"] = "tls"
+                stream["tlsSettings"] = {
+                    "serverName": host,
+                    "allowInsecure": True,
+                    "fingerprint": "chrome",
+                    "alpn": ["http/1.1"]
+                }
+            if net == "ws":
+                stream["wsSettings"] = {"path": path, "headers": {"Host": host}}
+            outbound = {
+                "protocol": "vmess",
+                "settings": {"vnext": [{"address": address, "port": port, "users": [{"id": uid, "alterId": int(conf.get("aid", 0)), "security": "auto"}]}]},
+                "streamSettings": stream
+            }
+            return outbound, address, port, "vmess"
+
+        elif link.startswith(("vless://", "trojan://")):
+            parsed = urllib.parse.urlparse(link)
+            protocol = parsed.scheme
+            uid_or_pwd = urllib.parse.unquote(parsed.username or "")
+            address = parsed.hostname
+            port = int(parsed.port or 443)
+            params = dict(urllib.parse.parse_qsl(parsed.query))
+            net = params.get("type", "tcp")
+            security = params.get("security", "tls" if (protocol == "trojan" or port in [443, 8443, 2053, 2083, 2087, 2096]) else "none")
+            sni = params.get("sni") or params.get("host") or ""
+            host = params.get("host") or params.get("sni") or ""
+            path = params.get("path", "/")
+            flow = params.get("flow", "").strip()
+            user_entry = {"id": uid_or_pwd, "encryption": "none"}
+            if flow:
+                user_entry["flow"] = flow
+            if protocol == "vless":
+                settings = {"vnext": [{"address": address, "port": port, "users": [user_entry]}]}
+            else:
+                settings = {"servers": [{"address": address, "port": port, "password": uid_or_pwd}]}
+            stream = {"network": net}
+            if security == "tls":
+                stream["security"] = "tls"
+                tls_settings = {
+                    "serverName": sni if sni else (host if host else address),
+                    "allowInsecure": True,
+                    "fingerprint": params.get("fp", "chrome") or "chrome"
+                }
+                alpn_val = params.get("alpn", "")
+                if alpn_val:
+                    tls_settings["alpn"] = alpn_val.split(",")
+                stream["tlsSettings"] = tls_settings
+            elif security == "reality":
+                stream["security"] = "reality"
+                stream["realitySettings"] = {
+                    "serverName": sni if sni else address,
+                    "fingerprint": "chrome",
+                    "publicKey": params.get("pbk", "").strip(),
+                    "shortId": params.get("sid", "").strip()
+                }
+            else:
+                stream["security"] = "none"
+            if net == "ws":
+                ws_settings = {"path": path}
+                if host:
+                    ws_settings["headers"] = {"Host": host}
+                stream["wsSettings"] = ws_settings
+            elif net == "grpc":
+                stream["grpcSettings"] = {"serviceName": params.get("serviceName", "")}
+            return {"protocol": protocol, "settings": settings, "streamSettings": stream}, address, port, protocol
+
+        elif link.startswith("ss://"):
+            body = link[5:].split("#")[0]
+            if "@" in body:
+                userinfo, hostport = body.split("@", 1)
+                if ":" not in userinfo:
+                    userinfo += "=" * ((4 - len(userinfo) % 4) % 4)
+                    userinfo = base64.b64decode(userinfo).decode("utf-8", errors="ignore")
+                method, password = userinfo.split(":", 1)
+            else:
+                body += "=" * ((4 - len(body) % 4) % 4)
+                decoded = base64.b64decode(body).decode("utf-8", errors="ignore")
+                userinfo, hostport = decoded.rsplit("@", 1)
+                method, password = userinfo.split(":", 1)
+            address, port = hostport.split(":", 1)
+            port = int(port.split("/")[0].split("?")[0])
+            outbound = {
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{"address": address, "port": port, "method": method, "password": urllib.parse.unquote(password)}]}
+            }
+            return outbound, address, port, "shadowsocks"
+        raise ValueError("不支持的节点协议")
+
+    def stop(self):
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self.process.kill()
+                    self.process.wait(timeout=1.0)
+                except Exception:
+                    pass
+            self.process = None
+        subprocess.run("pkill -9 -f xray", shell=True, stderr=subprocess.DEVNULL)
+
+    def _start_xray_and_probe(self, outbound):
+        config = {
+            "log": {"loglevel": "none"},
+            "inbounds": [
+                {"port": LOCAL_SOCKS_PORT, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}},
+                {"port": LOCAL_HTTP_PORT, "listen": "127.0.0.1", "protocol": "http"}
+            ],
+            "outbounds": [outbound]
+        }
+        with open(XRAY_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+
+        self.stop()
+        xray_bin = "/home/container/xray" if os.path.exists("/home/container/xray") else "xray"
+        start_t = time.time()
+        try:
+            self.process = subprocess.Popen(
+                [xray_bin, "run", "-c", XRAY_CONFIG_PATH],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True
+            )
+            port_ready, process_dead = wait_port_open_or_dead("127.0.0.1", LOCAL_HTTP_PORT, self.process, timeout=2.5)
+            if process_dead or not port_ready:
+                self.stop()
+                return False, int((time.time() - start_t) * 1000)
+
+            proxies = {
+                "http": f"http://127.0.0.1:{LOCAL_HTTP_PORT}",
+                "https": f"http://127.0.0.1:{LOCAL_HTTP_PORT}"
+            }
+            headers = {"User-Agent": USER_AGENTS[0]}
+
+            try:
+                r1 = requests.get("https://max.book118.com/robots.txt", proxies=proxies, headers=headers, timeout=4.0, verify=False)
+                if r1.status_code in (200, 301, 302, 403):
+                    return True, int((time.time() - start_t) * 1000)
+            except Exception:
+                pass
+
+            self.stop()
+            return False, int((time.time() - start_t) * 1000)
+        except Exception:
+            self.stop()
+            return False, int((time.time() - start_t) * 1000)
+
+    def _filter_links_two_stage(self, links_to_test, max_needed=MAX_VALID_NODES_POOL):
+        if not links_to_test:
+            return []
+
+        parsed_list = []
+        for link in links_to_test:
+            try:
+                outbound, addr, port, proto = self._parse_node_to_outbound(link)
+                if outbound and addr:
+                    parsed_list.append({
+                        "link": link, "outbound": outbound,
+                        "addr": addr, "port": port, "proto": proto,
+                        "tag": f"{addr}:{port}({proto})"
+                    })
+            except Exception:
+                pass
+
+        tcp_passed = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=TCP_PRECHECK_WORKERS) as executor:
+            future_map = {executor.submit(raw_tcp_precheck, item["addr"], item["port"]): item for item in parsed_list}
+            for future in concurrent.futures.as_completed(future_map):
+                item = future_map[future]
+                try:
+                    ok, tcp_ms = future.result()
+                    if ok:
+                        item["tcp_ms"] = tcp_ms
+                        tcp_passed.append(item)
+                except Exception:
+                    pass
+
+        tcp_passed.sort(key=lambda x: x.get("tcp_ms", 9999))
+        logger.info(f"✅ [TCP极速预筛] 存活 {len(tcp_passed)} 个节点，开始筛选前 {max_needed} 个直通 Book118 的节点...")
+
+        passed_nodes = []
+        for item in tcp_passed:
+            ok, cost_ms = self._start_xray_and_probe(item["outbound"])
+            if ok:
+                item["proxy_ms"] = cost_ms
+                passed_nodes.append(item)
+                logger.info(f"   ✅ [{len(passed_nodes)}/{max_needed}] 节点有效 -> {item['tag']} | {cost_ms}ms")
+                if len(passed_nodes) >= max_needed:
+                    break
+            else:
+                logger.info(f"   ❌ {item['tag']} 无法直通Book118(已剔除)")
+
+        return passed_nodes
+
+    def check_and_reload_nodes(self, force_full_recheck=False):
+        current_links = self._read_links_from_file()
+        current_set = set(current_links)
+        if not current_links:
+            self.stop()
+            self.current_node = None
+            return False
+
+        if force_full_recheck or not self.valid_nodes:
+            self.valid_nodes = self._filter_links_two_stage(current_links, max_needed=MAX_VALID_NODES_POOL)
+            self.last_nodes_set = current_set
+            if not self.valid_nodes:
+                self.stop()
+                return False
+            random.shuffle(self.valid_nodes)
+            self.node_cycle = cycle(self.valid_nodes)
+            return self.switch_to_next_valid_node()
+
+        added_links = list(current_set - self.last_nodes_set)
+        removed_links = self.last_nodes_set - current_set
+        if added_links or removed_links:
+            logger.info(f"🆕 [本地节点更新] 检测到 {self.xray_file} 变化 (新增:{len(added_links)}, 移除:{len(removed_links)})")
+            self.last_nodes_set = current_set
+            if removed_links:
+                self.valid_nodes = [n for n in self.valid_nodes if n["link"] not in removed_links]
+            if added_links:
+                new_ok = self._filter_links_two_stage(added_links, max_needed=10)
+                if new_ok:
+                    self.valid_nodes.extend(new_ok)
+            if not self.valid_nodes:
+                return False
+            random.shuffle(self.valid_nodes)
+            self.node_cycle = cycle(self.valid_nodes)
+            return self.switch_to_next_valid_node()
+
+        logger.info(f"✅ [节点复用] 本地 {self.xray_file} 无变化，继续使用当前可用池 ({len(self.valid_nodes)} 个可用)")
+        if not self.process or self.process.poll() is not None:
+            return self.switch_to_next_valid_node()
+        return True
+
+    def switch_to_next_valid_node(self):
+        if not self.valid_nodes:
+            self.stop()
+            self.current_node = None
+            return False
+        attempts = len(self.valid_nodes)
+        for _ in range(attempts):
+            candidate = next(self.node_cycle)
+            if self.current_node and len(self.valid_nodes) > 1 and candidate["link"] == self.current_node["link"]:
+                candidate = next(self.node_cycle)
+            ok, cost_ms = self._start_xray_and_probe(candidate["outbound"])
+            if ok:
+                self.current_node = candidate
+                logger.info(f"🎉 [节点已激活] 当前出口 -> {candidate['tag']} | 延迟: {cost_ms}ms")
+                return True
+            else:
+                self.valid_nodes = [n for n in self.valid_nodes if n["link"] != candidate["link"]]
+                if not self.valid_nodes:
+                    break
+                self.node_cycle = cycle(self.valid_nodes)
+        self.stop()
+        self.current_node = None
+        return False
+
+
+# ==================== 模块5: 本地 URL 管理 ====================
+class URLManager:
+    def __init__(self, urls_file=LOCAL_URLS_FILE):
+        self.urls_file = urls_file
+        self.last_urls = []
+
+    def check_and_get_urls(self):
+        if not os.path.exists(self.urls_file):
+            logger.warning(f"⚠️ 本地尚未找到 {self.urls_file} 文件。")
+            return []
+        with open(self.urls_file, "r", encoding="utf-8") as f:
+            urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        cleaned = [u if u.startswith(("http://", "https://")) else "https://" + u for u in urls]
+        if not self.last_urls:
+            logger.info(f"📋 [本地队列加载] 从 {self.urls_file} 共加载 {len(cleaned)} 个目标网页")
+        elif cleaned != self.last_urls:
+            logger.info(f"🆕 [本地队列更新] 检测到 {self.urls_file} 内容变化，已更新至 {len(cleaned)} 个网页")
+        else:
+            logger.info(f"✅ [本地队列检查] {self.urls_file} 无变化，共 {len(cleaned)} 个网页")
+        self.last_urls = cleaned
+        return cleaned
+
+
+# ==================== 模块6: 防崩溃自愈型精简浏览器控制器 ====================
+class LiteHeadlessBrowser:
+    def __init__(self, wrapper_bin, use_proxy=True):
+        from playwright.sync_api import sync_playwright
+        self.pw = sync_playwright().start()
+        self.use_proxy = use_proxy
+        self.stat_hits = 0
+
+        # 稍微放宽 V8 内存上限到 96MB（防止单个复杂文档网页把进程撑崩），改由每页彻底销毁重建 Page 来控内存
+        launch_args = [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-translate",
+            "--no-first-run",
+            "--single-process",
+            "--renderer-process-limit=1",
+            "--in-process-gpu",
+            "--js-flags=--max-old-space-size=96 --expose-gc",
+            "--disk-cache-size=1",
+            "--media-cache-size=1",
+            "--aggressive-cache-discard",
+            "--disable-site-isolation-trials",
+            "--ignore-certificate-errors",
+            "--disable-blink-features=AutomationControlled",
+        ]
+
+        proxy_cfg = {"server": f"http://127.0.0.1:{LOCAL_HTTP_PORT}"} if use_proxy else None
+
+        launch_env = os.environ.copy()
+        launch_env["LD_LIBRARY_PATH"] = f"{LIB_DIR}:" + launch_env.get("LD_LIBRARY_PATH", "")
+        launch_env["MALLOC_ARENA_MAX"] = "2"
+
+        self.browser = self.pw.chromium.launch(
+            executable_path=wrapper_bin,
+            headless=True,
+            args=launch_args,
+            proxy=proxy_cfg,
+            env=launch_env
+        )
+        self._recreate_context()
+
+    def _recreate_context(self):
+        self.ua = random.choice(USER_AGENTS)
+        self.context = self.browser.new_context(
+            viewport={"width": 1366, "height": 768},
+            user_agent=self.ua,
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            ignore_https_errors=True
+        )
+        self.context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {} };
+        """)
+        self._new_fresh_page()
+
+    def _new_fresh_page(self):
+        if getattr(self, "page", None):
+            try:
+                self.page.close()
+            except Exception:
+                pass
+        self.page = self.context.new_page()
+        self.page.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in ("media", "font")
+            else route.continue_()
+        )
+
+        def _on_response(response):
+            u = response.url.lower()
+            if any(k in u for k in ["hm.baidu.com/hm.gif", "viewcount", "viewurl", "getpreview", "stat", "count", "click", "ajax", "cnzz", "51.la"]):
+                if response.status in (200, 204, 302):
+                    self.stat_hits += 1
+
+        self.page.on("response", _on_response)
+
+    def visit_and_interact(self, url):
+        t0 = time.time()
+        self.stat_hits = 0
+        try:
+            resp = self.page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=22000,
+                referer="https://www.baidu.com/link?url=KkKS_fake_search_result"
+            )
+            status = resp.status if resp else 200
+            load_ms = int((time.time() - t0) * 1000)
+
+            try:
+                self.page.wait_for_load_state("load", timeout=8000)
+            except Exception:
+                pass
+
+            title = self.page.title() or "文档详情"
+
+            if status == 403 or "403 forbidden" in title.lower():
+                logger.info(f"    ℹ️ [页面已删除/403] 状态码:{status} | {load_ms}ms | 标题:《{title[:28]}》")
+                return True
+            else:
+                logger.info(f"    ✅ [浏览器打开成功] 状态码:{status} | {load_ms}ms | 标题:《{title[:28]}》")
+
+            w1 = random.uniform(3.0, 5.0)
+            self.page.wait_for_timeout(int(w1 * 1000))
+
+            try:
+                self.page.mouse.move(random.randint(200, 600), random.randint(200, 500))
+                self.page.mouse.wheel(0, 400)
+                self.page.evaluate("window.scrollTo({top: document.body.scrollHeight / 3, behavior: 'smooth'});")
+            except Exception:
+                pass
+            w2 = random.uniform(2.5, 4.0)
+            self.page.wait_for_timeout(int(w2 * 1000))
+
+            try:
+                btn = self.page.query_selector(".more-btn, .read-more, .banner-more-btn, #moreBtn, div.fc2e, #btn_read_more")
+                if btn:
+                    btn.scroll_into_view_if_needed()
+                    self.page.wait_for_timeout(600)
+                    btn.click(force=True)
+                    logger.info("    🖱️ 触发【继续阅读/展开】点击成功")
+                    self.page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+            try:
+                self.page.mouse.wheel(0, 600)
+                self.page.evaluate("window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});")
+            except Exception:
+                pass
+            w3 = random.uniform(4.5, 7.0)
+            self.page.wait_for_timeout(int(w3 * 1000))
+
+            total_stay = w1 + w2 + w3
+            logger.info(
+                f"    📡 [真实浏览完成] 捕获有效统计/计数响应: {self.stat_hits} 个 | 总停留 {total_stay:.1f}s"
+            )
+            return True
+        finally:
+            # 每次访问完彻底销毁旧标签页并新建干净标签页，避免连续访问30多页后V8内存累积崩溃
+            try:
+                self._new_fresh_page()
+            except Exception:
+                pass
+
+    def close(self):
+        for obj in (getattr(self, "page", None), getattr(self, "context", None), getattr(self, "browser", None)):
+            if obj:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+        if getattr(self, "pw", None):
+            try:
+                self.pw.stop()
+            except Exception:
+                pass
+        subprocess.run("pkill -9 -f chrome-headless-shell", shell=True, stderr=subprocess.DEVNULL)
+        for fn in os.listdir(WORK_TMP_DIR):
+            if fn.startswith("playwright_"):
+                shutil.rmtree(os.path.join(WORK_TMP_DIR, fn), ignore_errors=True)
+
+
+# ==================== 模块7: 主循环 ====================
+def main():
+    init_xray_env()
+    wrapper_bin = ensure_lite_headless_browser()
+
+    proxy_mgr = XrayProxyManager(LOCAL_XRAY_FILE)
+    url_mgr = URLManager(LOCAL_URLS_FILE)
+
+    round_num = 1
+    urls_since_last_switch = 0
+    next_switch_threshold = random.randint(NODE_SWITCH_MIN_URLS, NODE_SWITCH_MAX_URLS)
+    last_keepalive_ts = time.time()
+
+    startup_crawled = (os.environ.get("SKIP_STARTUP_CRAWL_ONCE") == "1")
+
+    while True:
+        browser = None
+        try:
+            bjt_now = get_beijing_now()
+            today_str = bjt_now.strftime("%Y-%m-%d")
+            last_crawl_date = get_last_crawl_date()
+
+            logger.info("\n" + "#" * 60)
+            logger.info(
+                f"🔄 [第 {round_num} 轮] 北京时间: {bjt_now.strftime('%Y-%m-%d %H:%M:%S')} | "
+                f"上次爬虫日期: {last_crawl_date or '未执行'}"
+            )
+            logger.info("#" * 60)
+
+            need_sub_fetch = (round_num > 1 and (round_num - 1) % SUB_UPDATE_INTERVAL_ROUNDS == 0) or (not proxy_mgr.valid_nodes and round_num > 1)
+            update_nodes_from_subscriptions(LOCAL_XRAY_FILE, force_fetch=need_sub_fetch)
+
+            force_full = (round_num > 1 and (round_num - 1) % FORCE_RECHECK_ROUNDS == 0)
+            has_proxy = proxy_mgr.check_and_reload_nodes(force_full_recheck=force_full)
+            if not has_proxy and not need_sub_fetch:
+                logger.info("ℹ️ 本地现有节点均不可用，立即从内置订阅地址获取新节点...")
+                update_nodes_from_subscriptions(LOCAL_XRAY_FILE, force_fetch=True)
+                has_proxy = proxy_mgr.check_and_reload_nodes(force_full_recheck=True)
+
+            # 如果今日已经爬过且 urls.txt 存在，启动时直接跳过爬虫，避免每次重启容器都重爬一遍
+            should_crawl_now = (
+                (RUN_CRAWLER_ON_STARTUP and not startup_crawled and last_crawl_date != today_str)
+                or (bjt_now.hour >= DAILY_CRAWL_HOUR_BJT and last_crawl_date != today_str)
+                or not os.path.exists(LOCAL_URLS_FILE)
+            )
+            if should_crawl_now:
+                startup_crawled = True
+                updated = run_book118_crawler_and_update_urls(use_proxy=has_proxy, urls_file=LOCAL_URLS_FILE)
+                if bjt_now.hour >= DAILY_CRAWL_HOUR_BJT or updated:
+                    save_last_crawl_date(today_str)
+
+            valid_urls = url_mgr.check_and_get_urls()
+            if not valid_urls:
+                logger.warning("⚠️ 本地 urls.txt 为空，立即启动爬虫获取初始队列...")
+                run_book118_crawler_and_update_urls(use_proxy=has_proxy, urls_file=LOCAL_URLS_FILE)
+                valid_urls = url_mgr.check_and_get_urls()
+                if not valid_urls:
+                    logger.warning("⚠️ 仍未获取到链接，休眠 60 秒后重试...")
+                    time.sleep(60)
+                    continue
+
+            logger.info("🌐 正在拉起【精简版无头浏览器 (Chromium Headless Shell)】...")
+            browser = LiteHeadlessBrowser(wrapper_bin=wrapper_bin, use_proxy=has_proxy)
+            logger.info("✅ 精简版无头浏览器启动成功！")
+
+            logger.info("\n" + "=" * 60)
+            logger.info(f"🚀 [开始巡检] 第 {round_num} 轮 | 网页总数: {len(valid_urls)} | 可用节点池: {len(proxy_mgr.valid_nodes)}")
+            logger.info(f"ℹ️ 网页随机间隔: {INTERVAL_SECONDS_MIN}~{INTERVAL_SECONDS_MAX}s | 换节点阈值: 每 {NODE_SWITCH_MIN_URLS}~{NODE_SWITCH_MAX_URLS} 个网页")
+            logger.info("=" * 60)
+
+            for index, url in enumerate(valid_urls, start=1):
+                if time.time() - last_keepalive_ts >= COOKIE_KEEPALIVE_SECONDS:
+                    keepalive_book118_cookie()
+                    last_keepalive_ts = time.time()
+
+                bjt_now = get_beijing_now()
+                today_str = bjt_now.strftime("%Y-%m-%d")
+                if bjt_now.hour >= DAILY_CRAWL_HOUR_BJT and get_last_crawl_date() != today_str:
+                    logger.info(
+                        f"\n⏰ [每日9点定时任务触发] 当前北京时间 {bjt_now.strftime('%H:%M:%S')}！"
+                        f"正在关闭浏览器释放内存，启动 Book118 低点击文档爬虫..."
+                    )
+                    browser.close()
+                    browser = None
+                    updated = run_book118_crawler_and_update_urls(use_proxy=has_proxy, urls_file=LOCAL_URLS_FILE)
+                    save_last_crawl_date(today_str)
+
+                    if updated and AUTO_RESTART_AFTER_UPDATE:
+                        restart_self_process()
+                    elif updated:
+                        break
+                    else:
+                        browser = LiteHeadlessBrowser(wrapper_bin=wrapper_bin, use_proxy=has_proxy)
+
+                need_switch = False
+                if has_proxy and len(proxy_mgr.valid_nodes) > 0:
+                    if SWITCH_PROXY_EACH_URL and index > 1:
+                        need_switch = True
+                    elif urls_since_last_switch >= next_switch_threshold:
+                        logger.info(f"\n🔁 [定期轮换] 已连续访问 {urls_since_last_switch} 个网页，切换下一个可用节点并重置浏览器...")
+                        need_switch = True
+
+                if need_switch:
+                    browser.close()
+                    has_proxy = proxy_mgr.switch_to_next_valid_node()
+                    browser = LiteHeadlessBrowser(wrapper_bin=wrapper_bin, use_proxy=has_proxy)
+                    urls_since_last_switch = 0
+                    next_switch_threshold = random.randint(NODE_SWITCH_MIN_URLS, NODE_SWITCH_MAX_URLS)
+                    logger.info(f"ℹ️ [下次轮换] 访问 {next_switch_threshold} 个网页后再次切换节点")
+
+                node_label = proxy_mgr.current_node["tag"] if (has_proxy and proxy_mgr.current_node) else "直连模式"
+                logger.info(f"\n[{index}/{len(valid_urls)}] 节点: {node_label} | 正在访问: {url}")
+
+                try:
+                    browser.visit_and_interact(url)
+                    urls_since_last_switch += 1
+                except Exception as e:
+                    err_str = str(e)
+                    logger.error(f"    -> 页面访问异常: {err_str}")
+                    # 【核心修复】：捕获到 closed / crashed / Target 等浏览器进程关闭异常，或网络异常时，100% 立即重启浏览器自愈！
+                    if any(kw in err_str.lower() for kw in ["closed", "crashed", "target", "disconnected", "err_ssl", "err_timed_out", "err_connection", "timeout"]):
+                        logger.warning(">>> 检测到浏览器实例关闭或节点网络异常，立即重启精简浏览器并切换节点恢复...")
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
+                        has_proxy = proxy_mgr.switch_to_next_valid_node()
+                        browser = LiteHeadlessBrowser(wrapper_bin=wrapper_bin, use_proxy=has_proxy)
+                        urls_since_last_switch = 0
+
+                if index < len(valid_urls):
+                    wait_sec = random.uniform(INTERVAL_SECONDS_MIN, INTERVAL_SECONDS_MAX)
+                    logger.info(f"⏳ [网页间隔] 随机等待 {wait_sec:.1f} 秒...")
+                    time.sleep(wait_sec)
+
+            logger.info("\n" + "~" * 60)
+            logger.info(f"✨ [本轮完成] 第 {round_num} 轮全部 {len(valid_urls)} 个网页已访问完毕！")
+            logger.info(f"💤 休息 {ROUND_INTERVAL} 秒后，将重新读取本地 xray.txt 与 urls.txt 开启第 {round_num + 1} 轮...")
+            logger.info("~" * 60)
+
+            round_num += 1
+            time.sleep(ROUND_INTERVAL)
+
+        except Exception as e:
+            logger.error(f"⚠️ [主循环异常] {e}，10 秒后自动恢复...")
+            time.sleep(10)
+        finally:
+            if browser:
+                browser.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("程序已手动停止。")
